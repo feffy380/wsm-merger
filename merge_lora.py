@@ -204,7 +204,7 @@ def validation(args, pipeline, val_dataloader):
             loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.prediction_type)
         return loss
 
-    NUM_VAL_TIMESTEPS = 9  # 100, 200, ..., 800, 900
+    NUM_VAL_TIMESTEPS = 4  # 200, 400, 600, 800
     val_timesteps = np.linspace(0, noise_scheduler.config.num_train_timesteps, (NUM_VAL_TIMESTEPS + 2), dtype=int)[1:-1]
     val_total_steps = NUM_VAL_TIMESTEPS * len(val_dataloader)
 
@@ -266,7 +266,7 @@ def main(args):
         drop_last=False,
     )
 
-    pipeline = diffusers.StableDiffusionXLPipeline.from_single_file(ckpt_path, torch_dtype=torch.float16).to(args.device)
+    pipeline = diffusers.StableDiffusionXLPipeline.from_single_file(ckpt_path, torch_dtype=torch.float16, local_files_only=True).to(args.device)
     pipeline.vae.config.force_upcast = False
     pipeline.unet.requires_grad_(False)
     pipeline.vae.requires_grad_(False)
@@ -279,6 +279,7 @@ def main(args):
     best_val = float("inf")
     best_components = None
     best_lora = None
+    # TODO: exhaustive search
     for lora_sd, components in create_merges(lora_paths, args.merge_window, args.window_stride):
         pipeline.unload_lora_weights()
         pipeline.load_lora_weights(lora_sd)
@@ -288,7 +289,7 @@ def main(args):
             best_val = val_loss
             best_components = components
             best_lora = lora_sd
-    print(best_components[0].stem, best_components[-1].stem, best_val)
+    print("best:", best_components[0].stem, best_components[-1].stem, best_val)
     outpath = lora_dir / f"{lora_dir.stem}-merged.safetensors"
     safetensors.torch.save_file(best_lora, outpath, {"components": ",".join([c.name for c in best_components]), "val_loss": str(val_loss)})
     print(f"Wrote LoRA to {outpath}")
