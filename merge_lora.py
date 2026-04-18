@@ -34,6 +34,101 @@ class LoraInfo:
         return self.name()
 
 
+class LoraManager:
+    def __init__(self, lora_paths, device="cuda"):
+        self.lora_infos = [LoraInfo(path) for path in lora_paths]
+        self.lora_infos.sort(key=lambda item: item.steps())
+        self.loras = [safetensors.torch.load_file(lora_info.path, device=device) for lora_info in self.lora_infos]
+
+    def __len__(self):
+        return len(self.loras)
+
+    def __getitem__(self, idx):
+        return self.loras[idx], self.lora_infos[idx]
+
+    def merge_range(self, start, end):
+        # TODO: different merge strategies like 1-sqrt(t)
+        window = end - start + 1
+        weights = [1 / window] * window
+
+        state_dict = {}
+        for lora, weight in zip(self.loras[start:end+1], weights):
+            for key, val in lora.items():
+                if "alpha" in key:
+                    if key not in state_dict:
+                        state_dict[key] = val
+                elif key not in state_dict:
+                    state_dict[key] = val * weight
+                else:
+                    state_dict[key].add_(val * weight)
+
+        return state_dict, self.lora_infos[start:end+1]
+
+
+class CenterOutStrategy:
+    """
+    Finds the single best point, then grows outward greedily.
+    Works best with smooth validation curve.
+    Skip first phase by providing an initial point.
+    """
+    def __init__(self, n, anchor=None):
+        self.n = n
+        self.anchor = anchor
+        self.next_anchor = 0 if anchor is None else n
+        self.start = 0
+        self.end = 0
+        self.best_loss = float("inf")
+        self.is_finished = False
+
+    def get_candidates(self):
+        """
+        Expand window left and right. None if boundary hit.
+
+        Returns list of (start, end) merge windows
+        """
+        if self.next_anchor < self.n:
+            # phase 1: find starting point with lowest loss
+            return [(self.next_anchor, self.next_anchor)]
+        else:
+            # phase 2: grow outward
+            left = (self.start - 1, self.end) if self.start > 0 else None
+            right = (self.start, self.end + 1) if self.end < self.n - 1 else None
+            return [left, right]
+
+    def update(self, losses: list):
+        """
+        Moves boundaries to the best performing side
+
+        Returns current best ((start, end), loss)
+        """
+        if len(losses) == 1:
+            # phase 1: find starting point with lowest loss
+            loss = losses[0]
+            if loss < self.best_loss:
+                self.anchor = self.next_anchor
+                self.best_loss = loss
+            self.next_anchor += 1
+            if self.next_anchor >= self.n:
+                self.start = self.anchor
+                self.end = self.anchor
+            return (self.anchor, self.anchor), self.best_loss
+        else:
+            # phase 2: grow outward
+            left, right = losses
+            left = left if left is not None else float("inf")
+            right = right if right is not None else float("inf")
+            if left <= right and left < self.best_loss:
+                self.start -= 1
+                self.best_loss = left
+            elif right < self.best_loss:
+                self.end += 1
+                self.best_loss = right
+            else:
+                # neither better. we're done
+                self.is_finished = True
+            return (self.start, self.end), self.best_loss
+
+
 class LatentDataset(Dataset):
     def __init__(self, root_folder, pipeline, resolution=1024):
         self.root_folder = root_folder
@@ -175,7 +270,7 @@ def apply_snr_weight(loss: torch.Tensor, timesteps: torch.IntTensor, noise_sched
     return loss
 
 
-def validation(args, pipeline, val_dataloader):
+def validate(args, pipeline, val_dataloader):
     unet: diffusers.UNet2DConditionModel = pipeline.unet
     vae: diffusers.AutoencoderKL = pipeline.vae
     noise_scheduler = diffusers.DDPMScheduler(
@@ -274,7 +369,6 @@ def create_merges(lora_paths, merge_window, window_stride=1):
 def main(args):
     dataset_path = Path(args.dataset_path).expanduser()
     ckpt_path = Path(args.ckpt_path).expanduser()
-    # TODO: generate chart
 
     pipeline = diffusers.StableDiffusionXLPipeline.from_single_file(ckpt_path, torch_dtype=torch.float16, local_files_only=True).to(args.device)
     pipeline.vae.config.force_upcast = False
@@ -293,22 +387,38 @@ def main(args):
         drop_last=False,
     )
 
-    lora_dir = Path(args.lora_path).expanduser()
-    lora_paths = [LoraInfo(path) for path in lora_dir.glob("*-step*.safetensors")]
-    lora_paths.sort(key=lambda item: item.steps())
+    lora_dir = Path(args.lora_dir).expanduser()
+    lora_manager = LoraManager(list(lora_dir.glob("*-step*.safetensors")), device=args.device)
     best_val = float("inf")
     best_components = None
     best_lora = None
     # TODO: exhaustive search
-    for lora_sd, components in create_merges(lora_paths, args.merge_window, args.window_stride):
-        pipeline.unload_lora_weights()
-        pipeline.load_lora_weights(lora_sd)
-        val_loss = validation(args, pipeline, val_dataloader)
-        print(f"steps {components[0].steps()}-{components[-1].steps()}: {val_loss}")
-        if val_loss < best_val:
-            best_val = val_loss
-            best_components = components
-            best_lora = lora_sd
+
+    search_strategy = CenterOutStrategy(len(lora_manager))
+    while not search_strategy.is_finished:
+        merge_windows = search_strategy.get_candidates()
+        losses = []
+        for merge_window in merge_windows:
+            if merge_window is None:
+                losses.append(None)
+                continue
+
+            lora_sd, components = lora_manager.merge_range(*merge_window)
+
+            # Calculate validation loss for the merge
+            pipeline.unload_lora_weights()
+            pipeline.load_lora_weights(lora_sd)
+            val_loss = validate(args, pipeline, val_dataloader)
+            losses.append(val_loss)
+
+            if val_loss < best_val:
+                best_val = val_loss
+                best_lora = lora_sd
+                best_components = components
+
+            print(f"steps {components[0].steps()}-{components[-1].steps()}: {val_loss}")
+        search_strategy.update(losses)
+
     print(f"best: steps {best_components[0].steps()}-{best_components[-1].steps()}: {best_val}")
 
     outpath = lora_dir / f"{lora_dir.stem}-merged.safetensors"
@@ -337,16 +447,8 @@ if __name__ == "__main__":
         help="Path to single file SDXL checkpoint",
     )
     parser.add_argument(
-        "--lora-path", type=str, required=True,
+        "--lora-dir", type=str, required=True,
         help="Path to dir with numbered LoRA checkpoints e.g., lora-step1234.safetensors",
-    )
-    parser.add_argument(
-        "--merge-window", "-w", type=int, default=4,
-        help="Merge window size (number of checkpoints to merge)",
-    )
-    parser.add_argument(
-        "--window-stride", "-s", type=int, default=1,
-        help="Merge window stride",
     )
     parser.add_argument(
         "--prediction-type", "-p", type=str, default="epsilon",
