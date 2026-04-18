@@ -259,7 +259,7 @@ def create_merges(lora_paths, merge_window, window_stride=1):
                 elif key not in state_dict:
                     state_dict[key] = lora[key] * weight
                 else:
-                    state_dict[key] += lora[key] * weight
+                    state_dict[key].add_(lora[key] * weight)
 
         yield state_dict, lora_paths[window_start:window_start+merge_window]
 
