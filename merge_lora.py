@@ -1,5 +1,6 @@
 # Parts adapted from https://github.com/spacepxl/demystifying-sd-finetuning
 
+from dataclasses import dataclass
 import math
 import random
 from argparse import ArgumentParser
@@ -19,24 +20,49 @@ from tqdm.auto import tqdm
 diffusers.logging.set_verbosity_error()
 
 
-class ImageDataset(Dataset):
-    def __init__(self, root_folder, resolution=1024):
+@dataclass
+class LoraInfo:
+    path: Path
+
+    def name(self) -> str:
+        return self.path.stem
+
+    def steps(self) -> int:
+        return int(self.name().split("step")[-1])
+
+    def __repr__(self):
+        return self.name()
+
+
+class LatentDataset(Dataset):
+    def __init__(self, root_folder, pipeline, resolution=1024):
         self.root_folder = root_folder
         self.resolution = resolution
-        self.image_paths = []
-        self.captions = []
-
-        exts = {".png", ".jpg", ".jpeg"}
-        for image_path in Path(root_folder).iterdir():
-            if image_path.suffix.lower() in exts:
-                self.image_paths.append(image_path)
-                self.captions.append(image_path.with_suffix(".txt").read_text().strip())
+        self.batches = []
 
         self.transforms = v2.Compose([
             v2.ToImage(),
-            v2.ToDtype(torch.float32, scale=True),
+            v2.ToDtype(pipeline.vae.dtype, scale=True),
             v2.Normalize([0.5], [0.5]),
         ])
+
+        print("Caching validation data")
+        exts = {".png", ".jpg", ".jpeg"}
+        for image_path in Path(root_folder).iterdir():
+            if image_path.suffix.lower() not in exts:
+                continue
+
+            latent, crop_top_left, original_size = self.preprocess_image(image_path, pipeline.vae)
+            caption = image_path.with_suffix(".txt").read_text().strip()
+            prompt_embeds, _, pooled_prompt_embeds, _ = pipeline.encode_prompt(caption, device=pipeline.text_encoder.device, do_classifier_free_guidance=False)
+            batch = {
+                "latent": latent.squeeze().cpu(),
+                "crop_top_left": crop_top_left,
+                "original_size": original_size,
+                "prompt_embeds": prompt_embeds.squeeze().cpu(),
+                "pooled_prompt_embeds": pooled_prompt_embeds.squeeze().cpu(),
+            }
+            self.batches.append(batch)
 
     def get_bucket(self, image: Image):
         """Calculate bucket dimensions with closest aspect ratio to original"""
@@ -92,20 +118,19 @@ class ImageDataset(Dataset):
 
         return image, ltrb
 
-    def __len__(self):
-        return len(self.image_paths)
-
-    def __getitem__(self, idx):
-        img = Image.open(self.image_paths[idx]).convert("RGB")
+    def preprocess_image(self, image_path, vae: diffusers.AutoencoderKL):
+        img = Image.open(image_path).convert("RGB")
         img, ltrb = self.crop_to_bucket(img)
         pixels = self.transforms(img)  # hw
-        caption = self.captions[idx]
-        return {
-            "pixels": pixels,
-            "crop_top_left": (ltrb[1], ltrb[0]),
-            "original_size": img.size[::-1],  # wh -> hw
-            "caption": caption,
-        }
+        latent = vae.encode(pixels.to(vae.device, dtype=vae.dtype).unsqueeze(0)).latent_dist.sample()
+        latent = latent * vae.config.scaling_factor
+        return latent, (ltrb[1], ltrb[0]), img.size[::-1]
+
+    def __len__(self):
+        return len(self.batches)
+
+    def __getitem__(self, idx):
+        return self.batches[idx]
 
 
 @contextmanager
@@ -163,15 +188,12 @@ def validation(args, pipeline, val_dataloader):
         rescale_betas_zero_snr=(args.prediction_type == "v_prediction"),
     )
 
-    def vae_encode(pixels):
-        latents = vae.encode(pixels.to(args.device, dtype=vae.dtype)).latent_dist.sample()
-        return latents * vae.config.scaling_factor
-
     def get_pred(batch, timesteps):
-        latents = batch["latents"]
+        latents = batch["latent"]
+        prompt_embeds = batch["prompt_embeds"]
+        pooled_prompt_embeds = batch["pooled_prompt_embeds"]
 
         # encode inputs
-        prompt_embeds, _, pooled_prompt_embeds, _ = pipeline.encode_prompt(batch["caption"], device=args.device, do_classifier_free_guidance=False)
         timesteps = torch.tensor(timesteps, dtype=torch.long, device=args.device)
 
         # get model prediction and target
@@ -208,23 +230,21 @@ def validation(args, pipeline, val_dataloader):
     val_timesteps = np.linspace(0, noise_scheduler.config.num_train_timesteps, (NUM_VAL_TIMESTEPS + 2), dtype=int)[1:-1]
     val_total_steps = NUM_VAL_TIMESTEPS * len(val_dataloader)
 
-    # pbar = tqdm(total=val_total_steps, desc="steps", dynamic_ncols=True)
-
     val_loss = 0.0
     with torch.inference_mode(), temp_rng(args.val_seed):
         for batch in val_dataloader:
-            batch["latents"] = vae_encode(batch["pixels"])
+            batch["latent"] = batch["latent"].to(args.device)
+            batch["prompt_embeds"] = batch["prompt_embeds"].to(args.device)
+            batch["pooled_prompt_embeds"] = batch["pooled_prompt_embeds"].to(args.device)
             for timestep in val_timesteps:
                 loss = get_pred(batch, timesteps=[timestep])
                 val_loss += loss.detach().item()
-        #         pbar.update(1)
-        # del pbar
 
     return val_loss / val_total_steps
 
 
 def create_merges(lora_paths, merge_window, window_stride=1):
-    loras = [safetensors.torch.load_file(lora_path, device="cuda") for lora_path in lora_paths]
+    loras = [safetensors.torch.load_file(lora_path.path, device="cuda") for lora_path in lora_paths]
     # TODO: different merge strategies like 1-sqrt(t)
     weights = [1 / merge_window] * merge_window
     window_start = 0
@@ -256,7 +276,14 @@ def main(args):
     ckpt_path = Path(args.ckpt_path).expanduser()
     # TODO: generate chart
 
-    val_dataset = ImageDataset(dataset_path)
+    pipeline = diffusers.StableDiffusionXLPipeline.from_single_file(ckpt_path, torch_dtype=torch.float16, local_files_only=True).to(args.device)
+    pipeline.vae.config.force_upcast = False
+    pipeline.unet.requires_grad_(False)
+    pipeline.vae.requires_grad_(False)
+    pipeline.text_encoder.requires_grad_(False)
+    pipeline.text_encoder_2.requires_grad_(False)
+
+    val_dataset = LatentDataset(dataset_path, pipeline)
     val_dataloader = DataLoader(
         dataset=val_dataset,
         batch_size=1,
@@ -266,16 +293,9 @@ def main(args):
         drop_last=False,
     )
 
-    pipeline = diffusers.StableDiffusionXLPipeline.from_single_file(ckpt_path, torch_dtype=torch.float16, local_files_only=True).to(args.device)
-    pipeline.vae.config.force_upcast = False
-    pipeline.unet.requires_grad_(False)
-    pipeline.vae.requires_grad_(False)
-    pipeline.text_encoder.requires_grad_(False)
-    pipeline.text_encoder_2.requires_grad_(False)
-
-    lora_dir = Path(args.lora_path)
-    lora_paths = list(lora_dir.glob("*-step*.safetensors"))
-    lora_paths.sort(key=lambda item: int(item.stem.split("step")[1]))
+    lora_dir = Path(args.lora_path).expanduser()
+    lora_paths = [LoraInfo(path) for path in lora_dir.glob("*-step*.safetensors")]
+    lora_paths.sort(key=lambda item: item.steps())
     best_val = float("inf")
     best_components = None
     best_lora = None
@@ -284,15 +304,25 @@ def main(args):
         pipeline.unload_lora_weights()
         pipeline.load_lora_weights(lora_sd)
         val_loss = validation(args, pipeline, val_dataloader)
-        print(f"{components[0].stem}...{components[-1].stem}: {val_loss}")
+        print(f"steps {components[0].steps()}-{components[-1].steps()}: {val_loss}")
         if val_loss < best_val:
             best_val = val_loss
             best_components = components
             best_lora = lora_sd
-    print("best:", best_components[0].stem, best_components[-1].stem, best_val)
+    print(f"best: steps {best_components[0].steps()}-{best_components[-1].steps()}: {best_val}")
+
     outpath = lora_dir / f"{lora_dir.stem}-merged.safetensors"
-    safetensors.torch.save_file(best_lora, outpath, {"components": ",".join([c.name for c in best_components]), "val_loss": str(val_loss)})
-    print(f"Wrote LoRA to {outpath}")
+    metadata = {
+        "components": ",".join([str(c.steps()) for c in best_components]),
+        "val_loss": str(val_loss),
+        "val_seed": str(args.val_seed),
+        "prediction_type": args.prediction_type,
+        "min_snr_gamma": str(args.min_snr_gamma),
+        "merge_window": str(args.merge_window),
+        "window_stride": str(args.window_stride),
+    }
+    safetensors.torch.save_file(best_lora, outpath, metadata)
+    print(f"Wrote merged LoRA to {outpath}")
 
 
 if __name__ == "__main__":
