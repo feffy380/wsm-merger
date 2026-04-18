@@ -1,21 +1,20 @@
-# Parts adapted from https://github.com/spacepxl/demystifying-sd-finetuning
+# validation code adapted from https://github.com/spacepxl/demystifying-sd-finetuning
 
-from dataclasses import dataclass
 import math
 import random
 from argparse import ArgumentParser
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 import diffusers
 import numpy as np
+import safetensors.torch
 import torch
 from diffusers.training_utils import compute_snr
 from PIL import Image
-import safetensors.torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import v2
-from tqdm.auto import tqdm
 
 diffusers.logging.set_verbosity_error()
 
