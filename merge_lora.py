@@ -9,7 +9,7 @@ from pathlib import Path
 
 import diffusers
 import numpy as np
-import safetensors.torch
+import safetensors
 import torch
 from diffusers.training_utils import compute_snr
 from PIL import Image
@@ -37,7 +37,7 @@ class LoraManager:
     def __init__(self, lora_paths, device="cuda"):
         self.lora_infos = [LoraInfo(path) for path in lora_paths]
         self.lora_infos.sort(key=lambda item: item.steps())
-        self.loras = [safetensors.torch.load_file(lora_info.path, device=device) for lora_info in self.lora_infos]
+        self.loras = [safetensors.safe_open(lora_info.path, framework="pt", device=device) for lora_info in self.lora_infos]
 
     def __len__(self):
         return len(self.loras)
@@ -45,29 +45,29 @@ class LoraManager:
     def __getitem__(self, idx):
         return self.loras[idx], self.lora_infos[idx]
 
-    def merge_range(self, start, end, schedule):
+    def merge_range(self, start, end, decay_type):
         # derive merge weights according to Theorem 3.1 from the paper
         window = end - start + 1
         k = window - 1
         t = np.linspace(0, 1, window+1)
-        if schedule == "1-sqrt":
+        if decay_type == "1-sqrt":
             w = 1 - np.sqrt(t)
-        elif schedule == "linear":
+        elif decay_type == "linear":
             w = 1 - t
         else:
-            raise ValueError(f"Unknown decay schedule: {schedule}")
+            raise ValueError(f"Unknown decay type: {decay_type}")
         weights = np.concat([[1-w[1]], w[1:k] - w[2:k+1], [w[k]]])
 
         state_dict = {}
         for lora, weight in zip(self.loras[start:end+1], weights):
-            for key, val in lora.items():
+            for key in lora.keys():
                 if "alpha" in key:
                     if key not in state_dict:
-                        state_dict[key] = val
+                        state_dict[key] = lora.get_tensor(key)
                 elif key not in state_dict:
-                    state_dict[key] = val * weight
+                    state_dict[key] = lora.get_tensor(key) * weight
                 else:
-                    state_dict[key].add_(val * weight)
+                    state_dict[key].add_(lora.get_tensor(key) * weight)
 
         return state_dict, self.lora_infos[start:end+1]
 
@@ -349,22 +349,23 @@ def main(args):
     dataset_path = Path(args.dataset_path).expanduser()
     ckpt_path = Path(args.ckpt_path).expanduser()
 
-    pipeline = diffusers.StableDiffusionXLPipeline.from_single_file(ckpt_path, torch_dtype=torch.float16, local_files_only=True).to(args.device)
-    pipeline.vae.config.force_upcast = False
-    pipeline.unet.requires_grad_(False)
-    pipeline.vae.requires_grad_(False)
-    pipeline.text_encoder.requires_grad_(False)
-    pipeline.text_encoder_2.requires_grad_(False)
+    if args.range is None:
+        pipeline = diffusers.StableDiffusionXLPipeline.from_single_file(ckpt_path, torch_dtype=torch.float16, local_files_only=True).to(args.device)
+        pipeline.vae.config.force_upcast = False
+        pipeline.unet.requires_grad_(False)
+        pipeline.vae.requires_grad_(False)
+        pipeline.text_encoder.requires_grad_(False)
+        pipeline.text_encoder_2.requires_grad_(False)
 
-    val_dataset = LatentDataset(dataset_path, pipeline)
-    val_dataloader = DataLoader(
-        dataset=val_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True,
-        drop_last=False,
-    )
+        val_dataset = LatentDataset(dataset_path, pipeline)
+        val_dataloader = DataLoader(
+            dataset=val_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True,
+            drop_last=False,
+        )
 
     lora_dir = Path(args.lora_dir).expanduser()
     lora_manager = LoraManager(list(lora_dir.glob("*-step*.safetensors")), device=args.device)
@@ -372,39 +373,49 @@ def main(args):
     best_components = None
     best_lora = None
 
-    search_strategy = CenterOutStrategy(len(lora_manager))
-    while not search_strategy.is_finished:
-        merge_windows = search_strategy.get_candidates()
-        losses = []
-        for merge_window in merge_windows:
-            if merge_window is None:
-                losses.append(None)
-                continue
+    if args.range is not None:
+        # manual merge
+        merge_window = [i for i, info in enumerate(lora_manager.lora_infos) if info.steps() in args.range]
+        if len(merge_window) != 2:
+            raise ValueError(f"--range {args.range} is not a valid range of checkpoints")
+        best_lora, best_components = lora_manager.merge_range(*merge_window, decay_type=args.decay_type)
+        best_val = None
+        print(f"manual merge: steps {best_components[0].steps()}-{best_components[-1].steps()}")
+    else:
+        # automatic merge
+        search_strategy = CenterOutStrategy(len(lora_manager))
+        while not search_strategy.is_finished:
+            merge_windows = search_strategy.get_candidates()
+            losses = []
+            for merge_window in merge_windows:
+                if merge_window is None:
+                    losses.append(None)
+                    continue
 
-            lora_sd, components = lora_manager.merge_range(*merge_window, schedule=args.decay_schedule)
+                lora_sd, components = lora_manager.merge_range(*merge_window, decay_type=args.decay_type)
 
-            # Calculate validation loss for the merge
-            pipeline.unload_lora_weights()
-            pipeline.load_lora_weights(lora_sd)
-            val_loss = validate(args, pipeline, val_dataloader)
-            losses.append(val_loss)
+                # Calculate validation loss for the merge
+                pipeline.unload_lora_weights()
+                pipeline.load_lora_weights(lora_sd)
+                val_loss = validate(args, pipeline, val_dataloader)
+                losses.append(val_loss)
 
-            if val_loss < best_val:
-                best_val = val_loss
-                best_lora = lora_sd
-                best_components = components
+                if val_loss < best_val:
+                    best_val = val_loss
+                    best_lora = lora_sd
+                    best_components = components
 
-            print(f"steps {components[0].steps()}-{components[-1].steps()}: {val_loss}")
-        search_strategy.update(losses)
+                print(f"steps {components[0].steps()}-{components[-1].steps()}: {val_loss}")
+            search_strategy.update(losses)
 
-    print(f"best: steps {best_components[0].steps()}-{best_components[-1].steps()}: {best_val}")
+        print(f"best: steps {best_components[0].steps()}-{best_components[-1].steps()}: {best_val}")
 
     outpath = lora_dir / f"{lora_dir.stem}-merged.safetensors"
     metadata = {
         "components": ",".join([str(c.steps()) for c in best_components]),
-        "val_loss": str(val_loss),
+        "val_loss": str(best_val),
         "val_seed": str(args.val_seed),
-        "decay_schedule": args.decay_schedule,
+        "decay_type": args.decay_type,
         "prediction_type": args.prediction_type,
         "min_snr_gamma": str(args.min_snr_gamma),
     }
@@ -428,9 +439,13 @@ if __name__ == "__main__":
         help="Path to dir with numbered LoRA checkpoints e.g., lora-step1234.safetensors",
     )
     parser.add_argument(
-        "--decay-schedule", "-d", default="1-sqrt",
+        "--decay-type", "-d", default="1-sqrt",
         choices=["1-sqrt", "linear"],
         help="LR decay schedule to use for merging: [1-sqrt, linear] (default: 1-sqrt)",
+    )
+    parser.add_argument(
+        "--range", "-r", type=int, nargs=2,
+        help="Merge a specified range of checkpoints",
     )
     parser.add_argument(
         "--prediction-type", "-p", type=str, default="epsilon",
