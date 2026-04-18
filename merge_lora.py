@@ -45,10 +45,18 @@ class LoraManager:
     def __getitem__(self, idx):
         return self.loras[idx], self.lora_infos[idx]
 
-    def merge_range(self, start, end):
-        # TODO: different merge strategies like 1-sqrt(t)
+    def merge_range(self, start, end, schedule):
+        # derive merge weights according to Theorem 3.1 from the paper
         window = end - start + 1
-        weights = [1 / window] * window
+        k = window - 1
+        t = np.linspace(0, 1, window+1)
+        if schedule == "1-sqrt":
+            w = 1 - np.sqrt(t)
+        elif schedule == "linear":
+            w = 1 - t
+        else:
+            raise ValueError(f"Unknown decay schedule: {schedule}")
+        weights = np.concat([[1-w[1]], w[1:k] - w[2:k+1], [w[k]]])
 
         state_dict = {}
         for lora, weight in zip(self.loras[start:end+1], weights):
@@ -337,34 +345,6 @@ def validate(args, pipeline, val_dataloader):
     return val_loss / val_total_steps
 
 
-def create_merges(lora_paths, merge_window, window_stride=1):
-    loras = [safetensors.torch.load_file(lora_path.path, device="cuda") for lora_path in lora_paths]
-    # TODO: different merge strategies like 1-sqrt(t)
-    weights = [1 / merge_window] * merge_window
-    window_start = 0
-    while window_start + merge_window  <= len(loras):
-        state_dict = {}
-        subset = loras[window_start:window_start+merge_window]
-        for lora, weight in zip(subset, weights):
-            for key in lora.keys():
-                if "alpha" in key:
-                    if key not in state_dict:
-                        state_dict[key] = lora[key]
-                elif key not in state_dict:
-                    state_dict[key] = lora[key] * weight
-                else:
-                    state_dict[key].add_(lora[key] * weight)
-
-        yield state_dict, lora_paths[window_start:window_start+merge_window]
-
-        if window_start + merge_window == len(loras):
-            break
-        window_start += window_stride
-        # clamp if stride would make us skip a window
-        if window_start + merge_window > len(loras):
-            window_start = len(loras) - merge_window
-
-
 def main(args):
     dataset_path = Path(args.dataset_path).expanduser()
     ckpt_path = Path(args.ckpt_path).expanduser()
@@ -391,7 +371,6 @@ def main(args):
     best_val = float("inf")
     best_components = None
     best_lora = None
-    # TODO: exhaustive search
 
     search_strategy = CenterOutStrategy(len(lora_manager))
     while not search_strategy.is_finished:
@@ -402,7 +381,7 @@ def main(args):
                 losses.append(None)
                 continue
 
-            lora_sd, components = lora_manager.merge_range(*merge_window)
+            lora_sd, components = lora_manager.merge_range(*merge_window, schedule=args.decay_schedule)
 
             # Calculate validation loss for the merge
             pipeline.unload_lora_weights()
@@ -425,10 +404,9 @@ def main(args):
         "components": ",".join([str(c.steps()) for c in best_components]),
         "val_loss": str(val_loss),
         "val_seed": str(args.val_seed),
+        "decay_schedule": args.decay_schedule,
         "prediction_type": args.prediction_type,
         "min_snr_gamma": str(args.min_snr_gamma),
-        "merge_window": str(args.merge_window),
-        "window_stride": str(args.window_stride),
     }
     safetensors.torch.save_file(best_lora, outpath, metadata)
     print(f"Wrote merged LoRA to {outpath}")
@@ -448,6 +426,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--lora-dir", type=str, required=True,
         help="Path to dir with numbered LoRA checkpoints e.g., lora-step1234.safetensors",
+    )
+    parser.add_argument(
+        "--decay-schedule", "-d", default="1-sqrt",
+        choices=["1-sqrt", "linear"],
+        help="LR decay schedule to use for merging: [1-sqrt, linear] (default: 1-sqrt)",
     )
     parser.add_argument(
         "--prediction-type", "-p", type=str, default="epsilon",
