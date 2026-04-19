@@ -85,6 +85,7 @@ class CenterOutStrategy:
         self.next_anchor = 0 if anchor is None else n
         self.start = 0
         self.end = 0
+        self.step_size = 1
         self.best_loss = float("inf")
         self.is_finished = False
 
@@ -99,8 +100,13 @@ class CenterOutStrategy:
             return [(self.next_anchor, self.next_anchor)]
         else:
             # phase 2: grow outward
-            left = (self.start - 1, self.end) if self.start > 0 else None
-            right = (self.start, self.end + 1) if self.end < self.n - 1 else None
+            left = (self.start - self.step_size, self.end) if self.start - self.step_size >= 0 else None
+            right = (self.start, self.end + self.step_size) if self.end + self.step_size < self.n else None
+            if left is None and right is None:
+                # both exceeded. clamp and stop search
+                self.is_finished = True
+                left = (0, self.end)
+                right = (self.start, self.n)
             return [left, right]
 
     def update(self, losses: list):
@@ -109,7 +115,7 @@ class CenterOutStrategy:
 
         Returns current best ((start, end), loss)
         """
-        # TODO: dynamic step size to overcome noisy loss curve
+        # TODO: grow one direction at a time because merge window tends to be right of the lowest point
         if len(losses) == 1:
             # phase 1: find starting point with lowest loss
             loss = losses[0]
@@ -124,17 +130,22 @@ class CenterOutStrategy:
         else:
             # phase 2: grow outward
             left, right = losses
+            if left is None and right is None:
+                self.is_finished = True
+                return (self.start, self.end), self.best_loss
             left = left if left is not None else float("inf")
             right = right if right is not None else float("inf")
             if left <= right and left < self.best_loss:
-                self.start -= 1
+                self.start -= self.step_size
                 self.best_loss = left
+                self.step_size = 1
             elif right < self.best_loss:
-                self.end += 1
+                self.end += self.step_size
                 self.best_loss = right
+                self.step_size = 1
             else:
-                # neither better. we're done
-                self.is_finished = True
+                # neither better. double the step size
+                self.step_size *= 2
             return (self.start, self.end), self.best_loss
 
 
