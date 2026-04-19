@@ -348,29 +348,14 @@ def validate(args, pipeline, val_dataloader):
 
 
 def save_chart(points, optimum, outdir):
-    # one line for each window size
-    points.sort(key=lambda point: (point[0][1] - point[0][0], point[0][1]))
-    lines = []
-    line = []
-    while len(points) > 0:
-        point = points.pop(0)
-        if len(line) > 0 and (point[0][1] - point[0][0]) > (line[0][0][1] - line[0][0][0]):
-            lines.append(line)
-            line = [point]
-        else:
-            line.append(point)
-    lines.append(line)
-    for line in lines:
-        window_size = line[0][0][1] - line[0][0][0]
-        windows, y = zip(*line)
-        x = [window[1] for window in windows]
-        plt.plot(x, y, label=f"w={window_size}" if window_size > 0 else "val_loss")
+    x, y = zip(*points)
+    plt.plot(x, y, label="val_loss")
 
     # star at best point
     best_window, best_val = optimum
     star_xy = (best_window[1], best_val)
     plt.plot(*star_xy, marker="*", color="gold", markersize=15, label=f"{best_window[0]}-{best_window[1]}")
-    plt.annotate(str(round(best_val, 4)), star_xy)
+    plt.annotate(str(round(best_val, 5)), star_xy)
 
     # formatting
     plt.title("Merge windows")
@@ -395,7 +380,7 @@ def main(args):
         pipeline.text_encoder.requires_grad_(False)
         pipeline.text_encoder_2.requires_grad_(False)
 
-        val_dataset = LatentDataset(dataset_path, pipeline)
+        val_dataset = LatentDataset(dataset_path, pipeline, resolution=args.resolution)
         val_dataloader = DataLoader(
             dataset=val_dataset,
             batch_size=1,
@@ -459,9 +444,9 @@ def main(args):
 
                 print(f"steps {components[0].steps()}-{components[-1].steps()}: {val_loss}")
 
-                # save results for graph
-                window = (components[0].steps(), components[-1].steps())
-                results.append((window, val_loss))
+                # save results for validation curve
+                if merge_window[0] == merge_window[1]:
+                    results.append((components[0].steps(), val_loss))
             search_strategy.update(losses)
 
         print(f"best: steps {best_components[0].steps()}-{best_components[-1].steps()}: {best_val}")
@@ -489,6 +474,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--lora-dir", type=str, required=True,
         help="Path to dir with numbered LoRA checkpoints e.g., lora-step1234.safetensors",
+    )
+    parser.add_argument(
+        "--resolution", type=int, default=1024,
+        help="Resolution to use for validation",
     )
     parser.add_argument(
         "--decay-type", "-d", default="1-sqrt",

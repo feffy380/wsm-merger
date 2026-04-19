@@ -40,6 +40,7 @@ The best model will be saved to `lora-dir` with a `-merged` suffix.
 | `--dataset-path` | Path to validation dataset (images + .txt captions) |
 | `--ckpt-path` | Path to the base SDXL checkpoint (single file) |
 | `--lora-dir` | Directory containing checkpoints named `*-step[number].safetensors` |
+| `--resolution` | Resolution to use for validation (default: 1024) |
 | `--decay-type`, `-d` | LR decay schedule to use for merging: [1-sqrt, linear] (default: `1-sqrt`) |
 | `--range`, `-r` | Merge a specified range of checkpoints |
 | `--prediction-type`, `-p` | Use `epsilon` or `v_prediction` (default: `epsilon`) |
