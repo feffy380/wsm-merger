@@ -328,7 +328,7 @@ def validate(args, pipeline, val_dataloader):
             loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma, args.prediction_type)
         return loss
 
-    NUM_VAL_TIMESTEPS = 4  # 200, 400, 600, 800
+    NUM_VAL_TIMESTEPS = args.val_num_timesteps  # 4 -> 200, 400, 600, 800
     val_timesteps = np.linspace(0, noise_scheduler.config.num_train_timesteps, (NUM_VAL_TIMESTEPS + 2), dtype=int)[1:-1]
     val_total_steps = NUM_VAL_TIMESTEPS * len(val_dataloader)
 
@@ -458,6 +458,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--val-seed", type=int, default=380,
         help="Validation random seed",
+    )
+    parser.add_argument(
+        "--val-num-timesteps", "-t", type=int, default=4,
+        help="Number of timesteps to use to calculate validation loss (default: 4)",
     )
     parser.add_argument("--device", type=str, default="cuda", help="Compute device")
 
