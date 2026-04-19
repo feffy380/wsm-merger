@@ -368,10 +368,19 @@ def main(args):
         )
 
     lora_dir = Path(args.lora_dir).expanduser()
-    lora_manager = LoraManager(list(lora_dir.glob("*-step*.safetensors")), device=args.device)
+    lora_paths = list(lora_dir.glob("*-step*.safetensors"))
+    lora_manager = LoraManager(lora_paths, device=args.device)
     best_val = float("inf")
     best_components = None
     best_lora = None
+
+    outpath = lora_dir / f"{lora_dir.stem}-merged.safetensors"
+    metadata = {
+        "val_seed": str(args.val_seed),
+        "decay_type": args.decay_type,
+        "prediction_type": args.prediction_type,
+        "min_snr_gamma": str(args.min_snr_gamma),
+    }
 
     if args.range is not None:
         # manual merge
@@ -404,21 +413,18 @@ def main(args):
                     best_val = val_loss
                     best_lora = lora_sd
                     best_components = components
+                    # save best so far in case of interruption
+                    metadata["val_loss"] = best_val
+                    metadata["components"] = ",".join([str(c.steps()) for c in best_components])
+                    safetensors.torch.save_file(best_lora, outpath, metadata)
 
                 print(f"steps {components[0].steps()}-{components[-1].steps()}: {val_loss}")
             search_strategy.update(losses)
 
         print(f"best: steps {best_components[0].steps()}-{best_components[-1].steps()}: {best_val}")
 
-    outpath = lora_dir / f"{lora_dir.stem}-merged.safetensors"
-    metadata = {
-        "components": ",".join([str(c.steps()) for c in best_components]),
-        "val_loss": str(best_val),
-        "val_seed": str(args.val_seed),
-        "decay_type": args.decay_type,
-        "prediction_type": args.prediction_type,
-        "min_snr_gamma": str(args.min_snr_gamma),
-    }
+    metadata["val_loss"] = best_val
+    metadata["components"] = ",".join([str(c.steps()) for c in best_components])
     safetensors.torch.save_file(best_lora, outpath, metadata)
     print(f"Wrote merged LoRA to {outpath}")
 
