@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import diffusers
+import matplotlib.pyplot as plt
 import numpy as np
 import safetensors
 import torch
@@ -108,6 +109,7 @@ class CenterOutStrategy:
 
         Returns current best ((start, end), loss)
         """
+        # TODO: dynamic step size to overcome noisy loss curve
         if len(losses) == 1:
             # phase 1: find starting point with lowest loss
             loss = losses[0]
@@ -345,6 +347,42 @@ def validate(args, pipeline, val_dataloader):
     return val_loss / val_total_steps
 
 
+def save_chart(points, optimum, outdir):
+    # one line for each window size
+    points.sort(key=lambda point: (point[0][1] - point[0][0], point[0][1]))
+    lines = []
+    line = []
+    while len(points) > 0:
+        point = points.pop(0)
+        if len(line) > 0 and (point[0][1] - point[0][0]) > (line[0][0][1] - line[0][0][0]):
+            lines.append(line)
+            line = [point]
+        else:
+            line.append(point)
+    lines.append(line)
+    for line in lines:
+        window_size = line[0][0][1] - line[0][0][0]
+        windows, y = zip(*line)
+        x = [window[1] for window in windows]
+        plt.plot(x, y, label=f"w={window_size}" if window_size > 0 else "val_loss")
+
+    # star at best point
+    best_window, best_val = optimum
+    star_xy = (best_window[1], best_val)
+    plt.plot(*star_xy, marker="*", color="gold", markersize=15, label=f"{best_window[0]}-{best_window[1]}")
+    plt.annotate(str(round(best_val, 4)), star_xy)
+
+    # formatting
+    plt.title("Merge windows")
+    plt.xlabel("Iterations")
+    plt.ylabel("Validation loss")
+    plt.legend()
+    plt.grid(True)
+
+    # save as png
+    plt.savefig(outdir / "merge-results.png", dpi=300, bbox_inches="tight")
+
+
 def main(args):
     dataset_path = Path(args.dataset_path).expanduser()
     ckpt_path = Path(args.ckpt_path).expanduser()
@@ -393,6 +431,7 @@ def main(args):
     else:
         # automatic merge
         search_strategy = CenterOutStrategy(len(lora_manager))
+        results = []
         while not search_strategy.is_finished:
             merge_windows = search_strategy.get_candidates()
             losses = []
@@ -414,16 +453,23 @@ def main(args):
                     best_lora = lora_sd
                     best_components = components
                     # save best so far in case of interruption
-                    metadata["val_loss"] = best_val
+                    metadata["val_loss"] = str(best_val)
                     metadata["components"] = ",".join([str(c.steps()) for c in best_components])
                     safetensors.torch.save_file(best_lora, outpath, metadata)
 
                 print(f"steps {components[0].steps()}-{components[-1].steps()}: {val_loss}")
+
+                # save results for graph
+                window = (components[0].steps(), components[-1].steps())
+                results.append((window, val_loss))
             search_strategy.update(losses)
 
         print(f"best: steps {best_components[0].steps()}-{best_components[-1].steps()}: {best_val}")
 
-    metadata["val_loss"] = best_val
+        best_window = (best_components[0].steps(), best_components[-1].steps())
+        save_chart(results, (best_window, best_val), lora_dir)
+
+    metadata["val_loss"] = str(best_val)
     metadata["components"] = ",".join([str(c.steps()) for c in best_components])
     safetensors.torch.save_file(best_lora, outpath, metadata)
     print(f"Wrote merged LoRA to {outpath}")
