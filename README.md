@@ -51,3 +51,5 @@ The best model will be saved to `lora-dir` with a `-merged` suffix.
 ## Search strategy
 
 An exhaustive search requires evaluating $O(N^2)$ merge windows, which can take longer than training the LoRA itself. Instead, we take a greedy approach that assumes that the best individual checkpoint is inside the optimal merge window. We start from this checkpoint and expand the merge window outward until validation loss stops improving. This reduces the search complexity to $O(N)$.
+
+<img width="600" alt="merge-results" src="https://github.com/user-attachments/assets/33074ac8-ab6d-47ca-9c8b-853133b00b67" />
