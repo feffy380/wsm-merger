@@ -86,8 +86,13 @@ class CenterOutStrategy:
         self.start = 0
         self.end = 0
         self.step_size = 1
+        self.grow_direction = 0
         self.best_loss = float("inf")
-        self.is_finished = False
+        self.left_finished = False
+        self.right_finished = False
+
+    def is_finished(self):
+        return self.left_finished and self.right_finished
 
     def get_candidates(self):
         """
@@ -102,12 +107,21 @@ class CenterOutStrategy:
             # phase 2: grow outward
             left = (self.start - self.step_size, self.end) if self.start - self.step_size >= 0 else None
             right = (self.start, self.end + self.step_size) if self.end + self.step_size < self.n else None
-            if left is None and right is None:
-                # both exceeded. clamp and stop search
-                self.is_finished = True
-                left = (0, self.end)
-                right = (self.start, self.n)
-            return [left, right]
+
+            if self.grow_direction > 0:
+                window = right
+                if window is None:
+                    window = (self.start, self.n)
+                if window[1] == self.n - 1:
+                    self.right_finished = True
+            elif self.grow_direction < 0:
+                window = left
+                if window is None:
+                    window = (0, self.end)
+                if window[0] == 0:
+                    self.left_finished = True
+
+            return [window]
 
     def update(self, losses: list):
         """
@@ -116,7 +130,7 @@ class CenterOutStrategy:
         Returns current best ((start, end), loss)
         """
         # TODO: grow one direction at a time because merge window tends to be right of the lowest point
-        if len(losses) == 1:
+        if self.grow_direction == 0:
             # phase 1: find starting point with lowest loss
             loss = losses[0]
             if loss < self.best_loss:
@@ -124,28 +138,36 @@ class CenterOutStrategy:
                 self.best_loss = loss
             self.next_anchor += 1
             if self.next_anchor >= self.n:
+                # finished. set window to anchor and start second phase
                 self.start = self.anchor
                 self.end = self.anchor
+                self.grow_direction = 1
             return (self.anchor, self.anchor), self.best_loss
         else:
             # phase 2: grow outward
-            left, right = losses
-            if left is None and right is None:
-                self.is_finished = True
-                return (self.start, self.end), self.best_loss
-            left = left if left is not None else float("inf")
-            right = right if right is not None else float("inf")
-            if left <= right and left < self.best_loss:
+            loss = losses[0]
+            if self.grow_direction < 0 and loss < self.best_loss:
+                # grow left
                 self.start -= self.step_size
-                self.best_loss = left
+                self.best_loss = loss
                 self.step_size = 1
-            elif right < self.best_loss:
+            elif loss < self.best_loss:
+                # grow right
                 self.end += self.step_size
-                self.best_loss = right
+                self.best_loss = loss
                 self.step_size = 1
             else:
-                # neither better. double the step size
-                self.step_size *= 2
+                # neither better.
+                # flip direction or increase step size
+                if self.grow_direction > 0:
+                    if self.left_finished:
+                        self.step_size *= 2
+                    else:
+                        self.grow_direction *= -1
+                else:
+                    self.step_size *= 2
+                    if not self.right_finished:
+                        self.grow_direction *= -1
             return (self.start, self.end), self.best_loss
 
 
@@ -292,16 +314,7 @@ def apply_snr_weight(loss: torch.Tensor, timesteps: torch.IntTensor, noise_sched
 
 def validate(args, pipeline, val_dataloader):
     unet: diffusers.UNet2DConditionModel = pipeline.unet
-    vae: diffusers.AutoencoderKL = pipeline.vae
-    noise_scheduler = diffusers.DDPMScheduler(
-        beta_start=0.00085,
-        beta_end=0.012,
-        beta_schedule="scaled_linear",
-        num_train_timesteps=1000,
-        clip_sample=False,
-        prediction_type=args.prediction_type,
-        rescale_betas_zero_snr=(args.prediction_type == "v_prediction"),
-    )
+    noise_scheduler = pipeline.scheduler
 
     def get_pred(batch, timesteps):
         latents = batch["latent"]
@@ -346,7 +359,7 @@ def validate(args, pipeline, val_dataloader):
     val_total_steps = NUM_VAL_TIMESTEPS * len(val_dataloader)
 
     val_loss = 0.0
-    with torch.inference_mode(), temp_rng(args.val_seed):
+    with torch.inference_mode():
         for batch in val_dataloader:
             batch["latent"] = batch["latent"].to(args.device)
             batch["prompt_embeds"] = batch["prompt_embeds"].to(args.device)
@@ -390,6 +403,15 @@ def main(args):
         pipeline.vae.requires_grad_(False)
         pipeline.text_encoder.requires_grad_(False)
         pipeline.text_encoder_2.requires_grad_(False)
+        pipeline.scheduler = diffusers.DDPMScheduler(
+            beta_start=0.00085,
+            beta_end=0.012,
+            beta_schedule="scaled_linear",
+            num_train_timesteps=1000,
+            clip_sample=False,
+            prediction_type=args.prediction_type,
+            rescale_betas_zero_snr=(args.prediction_type == "v_prediction"),
+        )
 
         val_dataset = LatentDataset(dataset_path, pipeline, resolution=args.resolution)
         val_dataloader = DataLoader(
@@ -428,7 +450,7 @@ def main(args):
         # automatic merge
         search_strategy = CenterOutStrategy(len(lora_manager))
         results = []
-        while not search_strategy.is_finished:
+        while not search_strategy.is_finished():
             merge_windows = search_strategy.get_candidates()
             losses = []
             for merge_window in merge_windows:
@@ -441,7 +463,8 @@ def main(args):
                 # Calculate validation loss for the merge
                 pipeline.unload_lora_weights()
                 pipeline.load_lora_weights(lora_sd)
-                val_loss = validate(args, pipeline, val_dataloader)
+                with temp_rng(args.val_seed):
+                    val_loss = validate(args, pipeline, val_dataloader)
                 losses.append(val_loss)
 
                 if val_loss < best_val:
