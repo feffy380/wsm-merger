@@ -111,7 +111,7 @@ class CenterOutStrategy:
             if self.grow_direction > 0:
                 window = right
                 if window is None:
-                    window = (self.start, self.n)
+                    window = (self.start, self.n - 1)
                 if window[1] == self.n - 1:
                     self.right_finished = True
             elif self.grow_direction < 0:
@@ -382,7 +382,7 @@ def save_chart(points, optimum, outdir):
     plt.annotate(str(round(best_val, 5)), star_xy)
 
     # formatting
-    plt.title("Merge windows")
+    plt.title(outdir.stem)
     plt.xlabel("Iterations")
     plt.ylabel("Validation loss")
     plt.legend()
