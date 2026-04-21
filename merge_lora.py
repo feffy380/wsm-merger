@@ -171,6 +171,93 @@ class CenterOutStrategy:
             return (self.start, self.end), self.best_loss
 
 
+class ShrinkStrategy:
+    """
+    Progressively shrink merge window
+    """
+    def __init__(self, n):
+        self.step_size = 1
+        self.start = 0
+        self.end = n - 1
+        self.best_loss = None
+        self.finished = False
+
+    def is_finished(self):
+        return self.finished
+
+    def get_candidates(self):
+        """
+        Shrink window from left and right. None if window would be invalid.
+
+        Returns list of (start, end) merge windows
+        """
+        if self.best_loss is None:
+            return [(self.start, self.end)]
+
+        left = (self.start + self.step_size, self.end)
+        left = left if left[0] <= left[1] else None
+        right = (self.start, self.end - self.step_size)
+        right = right if right[1] >= right[0] else None
+
+        return [left, right]
+
+    def update(self, losses: list):
+        """
+        Moves boundaries to the best performing side
+
+        Returns current best ((start, end), loss)
+        """
+        if len(losses) == 1:
+            self.best_loss = losses[0]
+        else:
+            left, right = losses
+            if left is None and right is None:
+                self.finished = True
+            left = left if left is not None else float("inf")
+            right = right if right is not None else float("inf")
+
+            if left < right and left < self.best_loss:
+                # shrink left
+                self.start += self.step_size
+                self.best_loss = left
+                self.step_size = 1
+            elif right < self.best_loss:
+                # shrink right
+                self.end -= self.step_size
+                self.best_loss = right
+                self.step_size = 1
+            else:
+                # neither better.
+                # increase step size
+                self.step_size *= 2
+        return (self.start, self.end), self.best_loss
+
+
+class ValidateOnlyStrategy:
+    """
+    No merging, just find the single best checkpoint
+    """
+    def __init__(self, n: int):
+        self.n = n
+        self.finished = False
+        self.best_idx = None
+        self.best_loss = float("inf")
+
+    def is_finished(self):
+        return self.finished
+
+    def get_candidates(self):
+        return [(i, i) for i in range(self.n)]
+
+    def update(self, losses: list):
+        for i, loss in enumerate(losses):
+            if loss < self.best_loss:
+                self.best_idx = i
+                self.best_loss = loss
+        self.finished = True
+        return (self.best_idx, self.best_idx), self.best_loss
+
+
 class LatentDataset(Dataset):
     def __init__(self, root_folder, pipeline, resolution=1024):
         self.root_folder = root_folder
@@ -372,8 +459,9 @@ def validate(args, pipeline, val_dataloader):
 
 
 def save_chart(points, optimum, outdir):
-    x, y = zip(*points)
-    plt.plot(x, y, label="val_loss")
+    if points:
+        x, y = zip(*points)
+        plt.plot(x, y, label="val_loss")
 
     # star at best point
     best_window, best_val = optimum
@@ -393,10 +481,13 @@ def save_chart(points, optimum, outdir):
 
 
 def main(args):
-    dataset_path = Path(args.dataset_path).expanduser()
-    ckpt_path = Path(args.ckpt_path).expanduser()
-
     if args.range is None:
+        if args.dataset_path is None:
+            raise ValueError("Missing --dataset-path")
+        if args.ckpt_path is None:
+            raise ValueError("Missing --ckpt-path")
+        dataset_path = Path(args.dataset_path).expanduser()
+        ckpt_path = Path(args.ckpt_path).expanduser()
         pipeline = diffusers.StableDiffusionXLPipeline.from_single_file(ckpt_path, torch_dtype=torch.float16, local_files_only=True).to(args.device)
         pipeline.vae.config.force_upcast = False
         pipeline.unet.requires_grad_(False)
@@ -448,7 +539,12 @@ def main(args):
         print(f"manual merge: steps {best_components[0].steps()}-{best_components[-1].steps()}")
     else:
         # automatic merge
-        search_strategy = CenterOutStrategy(len(lora_manager))
+        if args.strategy == "grow":
+            search_strategy = CenterOutStrategy(len(lora_manager))
+        elif args.strategy == "shrink":
+            search_strategy = ShrinkStrategy(len(lora_manager))
+        elif args.strategy == "validate":
+            search_strategy = ValidateOnlyStrategy(len(lora_manager))
         results = []
         while not search_strategy.is_finished():
             merge_windows = search_strategy.get_candidates()
@@ -498,11 +594,11 @@ if __name__ == "__main__":
     parser = ArgumentParser()
 
     parser.add_argument(
-        "--dataset-path", type=str, required=True,
+        "--dataset-path", type=str,
         help="Path to validation dataset (.png or .jpg with matching .txt captions)",
     )
     parser.add_argument(
-        "--ckpt-path", type=str, required=True,
+        "--ckpt-path", type=str,
         help="Path to single file SDXL checkpoint",
     )
     parser.add_argument(
@@ -539,6 +635,11 @@ if __name__ == "__main__":
         help="Number of timesteps to use to calculate validation loss (default: 4)",
     )
     parser.add_argument("--device", type=str, default="cuda", help="Compute device")
+    parser.add_argument(
+        "--strategy", type=str, default="grow",
+        choices=["grow", "shrink", "validate"],
+        help="Search strategy to use: [grow, shrink, validate] (default: grow)"
+    )
 
     args = parser.parse_args()
     main(args)
